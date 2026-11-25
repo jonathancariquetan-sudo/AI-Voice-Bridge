@@ -1,162 +1,235 @@
 const $ = id => document.getElementById(id);
 
-let stream = null;
-let audioContext = null;
-let analyser = null;
-let animationFrame = null;
-let starting = false;
+const MAX_RECORDING_MS = 20000;
+const API_ENDPOINT = "/.netlify/functions/translate-turn";
 
-function setState(isOn, message) {
-  const micButton = $("start");
+let mediaStream = null;
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingTimer = null;
+let recordingMimeType = "audio/webm";
+let lastAudioUrl = null;
+let isProcessing = false;
+
+function setStatus(message, micOn = false) {
   $("status").textContent = "● " + message;
-  $("micstatus").textContent = isOn ? "MIC ON" : "MIC OFF";
-  micButton.classList.toggle("active", isOn);
-  micButton.innerHTML = isOn
-    ? "<span>🎙</span><strong>LISTENING</strong>"
-    : "<span>🎙</span><strong>START</strong>";
-  $("stop").disabled = !isOn;
-  $("start").disabled = starting || isOn;
-  $("test").disabled = starting || isOn;
+  $("micstatus").textContent = micOn ? "MIC ON" : "MIC OFF";
 }
 
-function stopAudioResources() {
-  if (animationFrame !== null) {
-    cancelAnimationFrame(animationFrame);
-    animationFrame = null;
-  }
-
-  if (stream) {
-    stream.getTracks().forEach(track => track.stop());
-    stream = null;
-  }
-
-  analyser = null;
-
-  if (audioContext) {
-    const contextToClose = audioContext;
-    audioContext = null;
-    contextToClose.close().catch(() => {});
-  }
-
-  $("start").style.transform = "";
+function setHint(message) {
+  $("hint").textContent = message;
 }
 
-async function start() {
-  if (starting || stream) return;
+function setRecordingUi(recording) {
+  $("start").disabled = recording || isProcessing;
+  $("test").disabled = !recording || isProcessing;
+  $("stop").disabled = !mediaStream && !recording;
+  $("start").innerHTML = recording
+    ? "<span>🎙</span><strong>RECORDING</strong>"
+    : "<span>🎙</span><strong>RECORD TURN</strong>";
+  $("start").classList.toggle("active", recording);
+}
 
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    $("hint").textContent = "Microphone access requires HTTPS and a supported browser.";
+function releaseMicrophone() {
+  if (recordingTimer) {
+    clearTimeout(recordingTimer);
+    recordingTimer = null;
+  }
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(track => track.stop());
+    mediaStream = null;
+  }
+  mediaRecorder = null;
+  setRecordingUi(false);
+}
+
+function getPreferredMimeType() {
+  if (!window.MediaRecorder) return "";
+  const choices = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  return choices.find(type => MediaRecorder.isTypeSupported(type)) || "";
+}
+
+async function startRecording() {
+  if (mediaStream || isProcessing) return;
+
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    setHint("This browser does not support microphone recording. Open the site in current Chrome over HTTPS.");
     return;
   }
 
-  starting = true;
-  $("start").disabled = true;
-  $("test").disabled = true;
-  $("hint").textContent = "Requesting microphone permission…";
+  if (!$("accessCode").value.trim()) {
+    setHint("Enter the private app access code first.");
+    $("accessCode").focus();
+    return;
+  }
 
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
+    setStatus("Requesting microphone");
+    setHint("Allow microphone access if Chrome asks.");
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
 
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) {
-      throw new Error("This browser does not support audio analysis.");
-    }
+    recordingMimeType = getPreferredMimeType() || "audio/webm";
+    mediaRecorder = new MediaRecorder(mediaStream, recordingMimeType ? { mimeType: recordingMimeType } : undefined);
+    recordedChunks = [];
+    mediaRecorder.addEventListener("dataavailable", event => {
+      if (event.data && event.data.size) recordedChunks.push(event.data);
+    });
+    mediaRecorder.addEventListener("stop", handleRecordingStopped, { once: true });
+    mediaRecorder.start(500);
 
-    audioContext = new AudioContextClass();
-    if (audioContext.state === "suspended") {
-      await audioContext.resume();
-    }
-
-    const source = audioContext.createMediaStreamSource(stream);
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 512;
-    source.connect(analyser);
-
-    setState(true, "Listening");
-    $("hint").textContent = "Microphone active. Speak to test the input meter.";
-    updateMeter();
+    setStatus("Recording", true);
+    setHint("Recording this speaker's turn. Tap Finish & translate when the sentence is complete.");
+    setRecordingUi(true);
+    recordingTimer = setTimeout(() => {
+      if (mediaRecorder?.state === "recording") {
+        setHint("20-second recording limit reached. Processing this turn.");
+        mediaRecorder.stop();
+      }
+    }, MAX_RECORDING_MS);
   } catch (error) {
-    stopAudioResources();
-    setState(false, "Ready");
-
+    releaseMicrophone();
+    setStatus("Ready");
     if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
-      $("hint").textContent = "Microphone permission denied. Allow microphone access in Chrome site settings.";
-    } else if (error.name === "NotFoundError") {
-      $("hint").textContent = "No microphone was found. Check your phone's microphone.";
+      setHint("Microphone permission denied. Allow microphone access in Chrome site settings.");
     } else {
-      $("hint").textContent = error.message || "Could not start the microphone. Please try again.";
+      setHint(error.message || "Could not start microphone recording.");
     }
-  } finally {
-    starting = false;
-    $("start").disabled = Boolean(stream);
-    $("test").disabled = Boolean(stream);
   }
 }
 
-function updateMeter() {
-  if (!analyser) return;
+function finishRecording() {
+  if (mediaRecorder?.state === "recording") {
+    mediaRecorder.stop();
+    setStatus("Preparing audio");
+    setHint("Recording stopped. Preparing your translation…");
+  }
+}
 
-  const samples = new Uint8Array(analyser.fftSize);
+function endSession() {
+  if (mediaRecorder?.state === "recording") {
+    mediaRecorder.removeEventListener("stop", handleRecordingStopped);
+    mediaRecorder.stop();
+  }
+  releaseMicrophone();
+  recordedChunks = [];
+  setStatus("Ready");
+  setHint("Session ended. Your microphone is off.");
+}
 
-  const tick = () => {
-    if (!analyser) return;
+function blobToBase64(blob) {
+  return blob.arrayBuffer().then(buffer => {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  });
+}
 
-    analyser.getByteTimeDomainData(samples);
+async function handleRecordingStopped() {
+  if (recordingTimer) {
+    clearTimeout(recordingTimer);
+    recordingTimer = null;
+  }
+  const mimeType = mediaRecorder?.mimeType || recordingMimeType;
+  const audioBlob = new Blob(recordedChunks, { type: mimeType });
+  releaseMicrophone();
+  recordedChunks = [];
 
-    let sum = 0;
-    for (const sample of samples) {
-      const normalized = (sample - 128) / 128;
-      sum += normalized * normalized;
+  if (!audioBlob.size) {
+    setStatus("Ready");
+    setHint("No audio was captured. Please try again.");
+    return;
+  }
+
+  await sendForTranslation(audioBlob, mimeType);
+}
+
+async function sendForTranslation(audioBlob, mimeType) {
+  isProcessing = true;
+  $("start").disabled = true;
+  $("test").disabled = true;
+  $("stop").disabled = true;
+  setStatus("Translating");
+  setHint("Sending this short audio turn securely for speech recognition and translation…");
+
+  try {
+    const isReply = $("direction").value === "reply";
+    const sourceLanguage = isReply ? $("target").value : $("source").value;
+    const targetLanguage = isReply ? $("source").value : $("target").value;
+    const audioBase64 = await blobToBase64(audioBlob);
+
+    const response = await fetch(API_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-app-access-code": $("accessCode").value.trim()
+      },
+      body: JSON.stringify({ audioBase64, mimeType, sourceLanguage, targetLanguage })
+    });
+
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error("AI backend is not deployed on this website yet. The Netlify deployment is the next setup step.");
+      }
+      throw new Error(result.error || "Translation request failed.");
     }
 
-    const rms = Math.sqrt(sum / samples.length);
-    const scale = 1 + Math.min(rms * 0.35, 0.12);
-    $("start").style.transform = `scale(${scale})`;
+    $("original").textContent = result.originalText;
+    $("translated").textContent = result.translatedText;
+    $("original").classList.remove("muted");
+    $("translated").classList.remove("muted");
 
-    animationFrame = requestAnimationFrame(tick);
-  };
+    if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
+    const audioBytes = Uint8Array.from(atob(result.audioBase64), char => char.charCodeAt(0));
+    const audioBlobResult = new Blob([audioBytes], { type: result.audioMimeType || "audio/mpeg" });
+    lastAudioUrl = URL.createObjectURL(audioBlobResult);
+    $("play").disabled = false;
 
-  tick();
+    setStatus("Translation ready");
+    setHint("Translation complete. Tap Play translation to hear the generated voice.");
+    await playTranslation();
+  } catch (error) {
+    setStatus("Ready");
+    setHint(error.message || "Could not complete this translation.");
+  } finally {
+    isProcessing = false;
+    $("start").disabled = false;
+    $("test").disabled = true;
+    $("stop").disabled = true;
+  }
 }
 
-function stop() {
-  stopAudioResources();
-  starting = false;
-  setState(false, "Ready");
-  $("start").disabled = false;
-  $("test").disabled = false;
-  $("hint").textContent = "Session ended. Tap Start to listen again.";
+async function playTranslation() {
+  if (!lastAudioUrl) return;
+  try {
+    const audio = new Audio(lastAudioUrl);
+    await audio.play();
+  } catch {
+    setHint("Translation is ready. Tap Play translation to start audio playback.");
+  }
 }
 
-$("start").addEventListener("click", start);
-$("test").addEventListener("click", start);
-$("stop").addEventListener("click", stop);
+$("start").addEventListener("click", startRecording);
+$("test").addEventListener("click", finishRecording);
+$("stop").addEventListener("click", endSession);
+$("play").addEventListener("click", playTranslation);
 
 $("clear").addEventListener("click", () => {
   $("original").textContent = "Waiting for speech…";
-  $("translated").textContent = "Translation will appear here when AI is connected.";
+  $("translated").textContent = "Translation will appear here.";
   $("original").classList.add("muted");
   $("translated").classList.add("muted");
-});
-
-$("play").addEventListener("click", () => {
-  const text = $("translated").textContent;
-  if (!text || $("translated").classList.contains("muted")) return;
-  if (!("speechSynthesis" in window)) {
-    $("hint").textContent = "Speech playback is not supported by this browser.";
-    return;
+  $("play").disabled = true;
+  if (lastAudioUrl) {
+    URL.revokeObjectURL(lastAudioUrl);
+    lastAudioUrl = null;
   }
-
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = $("target").value;
-  window.speechSynthesis.speak(utterance);
 });
 
 if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
