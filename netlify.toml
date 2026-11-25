@@ -4,6 +4,3 @@
 
 [functions]
   directory = "netlify/functions"
-
-[functions."translate-turn"]
-  timeout = 60
