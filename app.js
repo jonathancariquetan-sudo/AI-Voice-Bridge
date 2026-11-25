@@ -109,7 +109,7 @@ function finishRecording() {
 
 function endSession() {
   if (mediaRecorder?.state === "recording") {
-    mediaRecorder.onstop = null;
+    mediaRecorder.removeEventListener("stop", handleRecordingStopped);
     mediaRecorder.stop();
   }
   releaseMicrophone();
