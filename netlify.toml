@@ -1,0 +1,9 @@
+[build]
+  command = "mkdir -p public && cp index.html app.js styles.css manifest.webmanifest service-worker.js icon.svg public/"
+  publish = "public"
+
+[functions]
+  directory = "netlify/functions"
+
+[functions."translate-turn"]
+  timeout = 60
