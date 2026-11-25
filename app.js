@@ -1,8 +1,168 @@
-const $=id=>document.getElementById(id);let stream=null,ctx=null,analyser=null,raf=null;
-function state(on,msg){$("status").textContent="● "+msg;$("micstatus").textContent=on?"MIC ON":"MIC OFF";$("mic").classList.toggle("active",on);$("mic").innerHTML=on?"<span>🎙</span><strong>LISTENING</strong>":"<span>🎙</span><strong>START</strong>";$("stop").disabled=!on}
-async function start(){if(!navigator.mediaDevices?.getUserMedia){$("hint").textContent="Microphone needs HTTPS and a supported browser.";return}try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});ctx=new(window.AudioContext||window.webkitAudioContext)();const src=ctx.createMediaStreamSource(stream);analyser=ctx.createAnalyser();analyser.fftSize=256;src.connect(analyser);state(true,"Listening");$("hint").textContent="Microphone active. Speak to test the input meter.";meter();}catch(e){$("hint").textContent=e.name==="NotAllowedError"?"Microphone permission denied. Allow it in Chrome site settings.":e.message}}
-function meter(){if(!analyser)return;const a=new Uint8Array(analyser.frequencyBinCount);const tick=()=>{if(!analyser)return;analyser.getByteFrequencyData(a);let v=a.reduce((x,y)=>x+y,0)/a.length;$("mic").style.transform=`scale(${1+Math.min(v/180,.12)})`;raf=requestAnimationFrame(tick)};tick()}
-function stop(){if(raf)cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(t=>t.stop());if(ctx)ctx.close();stream=ctx=analyser=null;$("mic").style.transform="";state(false,"Ready");$("hint").textContent="Session ended. Tap Start to listen again."}
-$("start").onclick=start;$("stop").onclick=stop;$("test").onclick=start;$("clear").onclick=()=>{$("original").textContent="Waiting for speech…";$("translated").textContent="Translation will appear here when AI is connected.";$("original").classList.add("muted");$("translated").classList.add("muted")};
-$("play").onclick=()=>{const t=$("translated").textContent;if(t&&!$("translated").classList.contains("muted")){let u=new SpeechSynthesisUtterance(t);u.lang=$("target").value;speechSynthesis.speak(u)}};
-if("serviceWorker"in navigator&&location.protocol.startsWith("http"))addEventListener("load",()=>navigator.serviceWorker.register("./service-worker.js").catch(console.warn));
+const $ = id => document.getElementById(id);
+
+let stream = null;
+let audioContext = null;
+let analyser = null;
+let animationFrame = null;
+let starting = false;
+
+function setState(isOn, message) {
+  const micButton = $("start");
+  $("status").textContent = "● " + message;
+  $("micstatus").textContent = isOn ? "MIC ON" : "MIC OFF";
+  micButton.classList.toggle("active", isOn);
+  micButton.innerHTML = isOn
+    ? "<span>🎙</span><strong>LISTENING</strong>"
+    : "<span>🎙</span><strong>START</strong>";
+  $("stop").disabled = !isOn;
+  $("start").disabled = starting || isOn;
+  $("test").disabled = starting || isOn;
+}
+
+function stopAudioResources() {
+  if (animationFrame !== null) {
+    cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+  }
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  analyser = null;
+
+  if (audioContext) {
+    const contextToClose = audioContext;
+    audioContext = null;
+    contextToClose.close().catch(() => {});
+  }
+
+  $("start").style.transform = "";
+}
+
+async function start() {
+  if (starting || stream) return;
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $("hint").textContent = "Microphone access requires HTTPS and a supported browser.";
+    return;
+  }
+
+  starting = true;
+  $("start").disabled = true;
+  $("test").disabled = true;
+  $("hint").textContent = "Requesting microphone permission…";
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      throw new Error("This browser does not support audio analysis.");
+    }
+
+    audioContext = new AudioContextClass();
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    const source = audioContext.createMediaStreamSource(stream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+
+    setState(true, "Listening");
+    $("hint").textContent = "Microphone active. Speak to test the input meter.";
+    updateMeter();
+  } catch (error) {
+    stopAudioResources();
+    setState(false, "Ready");
+
+    if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
+      $("hint").textContent = "Microphone permission denied. Allow microphone access in Chrome site settings.";
+    } else if (error.name === "NotFoundError") {
+      $("hint").textContent = "No microphone was found. Check your phone's microphone.";
+    } else {
+      $("hint").textContent = error.message || "Could not start the microphone. Please try again.";
+    }
+  } finally {
+    starting = false;
+    $("start").disabled = Boolean(stream);
+    $("test").disabled = Boolean(stream);
+  }
+}
+
+function updateMeter() {
+  if (!analyser) return;
+
+  const samples = new Uint8Array(analyser.fftSize);
+
+  const tick = () => {
+    if (!analyser) return;
+
+    analyser.getByteTimeDomainData(samples);
+
+    let sum = 0;
+    for (const sample of samples) {
+      const normalized = (sample - 128) / 128;
+      sum += normalized * normalized;
+    }
+
+    const rms = Math.sqrt(sum / samples.length);
+    const scale = 1 + Math.min(rms * 0.35, 0.12);
+    $("start").style.transform = `scale(${scale})`;
+
+    animationFrame = requestAnimationFrame(tick);
+  };
+
+  tick();
+}
+
+function stop() {
+  stopAudioResources();
+  starting = false;
+  setState(false, "Ready");
+  $("start").disabled = false;
+  $("test").disabled = false;
+  $("hint").textContent = "Session ended. Tap Start to listen again.";
+}
+
+$("start").addEventListener("click", start);
+$("test").addEventListener("click", start);
+$("stop").addEventListener("click", stop);
+
+$("clear").addEventListener("click", () => {
+  $("original").textContent = "Waiting for speech…";
+  $("translated").textContent = "Translation will appear here when AI is connected.";
+  $("original").classList.add("muted");
+  $("translated").classList.add("muted");
+});
+
+$("play").addEventListener("click", () => {
+  const text = $("translated").textContent;
+  if (!text || $("translated").classList.contains("muted")) return;
+  if (!("speechSynthesis" in window)) {
+    $("hint").textContent = "Speech playback is not supported by this browser.";
+    return;
+  }
+
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = $("target").value;
+  window.speechSynthesis.speak(utterance);
+});
+
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./service-worker.js").catch(error => {
+      console.warn("Service worker registration failed:", error);
+    });
+  });
+}
